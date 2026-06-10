@@ -1,0 +1,36 @@
+[package]
+name = "cliboard"
+version = "0.1.0"
+description = "A smart clipboard for CLI commands"
+authors = ["kang-0909"]
+license = ""
+repository = "https://github.com/kang-0909/cliboard"
+edition = "2021"
+rust-version = "1.77.2"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.6.1", features = [] }
+
+[dependencies]
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+log = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+arboard = "3.6"
+block2 = "0.6.2"
+core-graphics = "0.25"
+core-foundation = "0.10"
+tauri = { version = "2.11.1", features = ["macos-private-api"] }
+tauri-plugin-log = "2"
+tauri-plugin-clipboard-manager = "2"
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-opener = "2"
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", features = ["block2", "NSApplication", "NSColor", "NSEvent", "NSGraphics", "NSPanel", "NSResponder", "NSRunningApplication", "NSView", "NSWindow", "NSWorkspace"] }
+objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSGeometry", "NSString"] }
