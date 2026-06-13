@@ -15,7 +15,7 @@ use objc2::{define_class, msg_send, rc::Retained, runtime::AnyObject, MainThread
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationOptions, NSApplicationActivationPolicy,
     NSAutoresizingMaskOptions, NSBackingStoreType, NSColor, NSEvent, NSEventMask,
-    NSFloatingWindowLevel, NSPanel, NSRunningApplication, NSView, NSWindow,
+    NSFloatingWindowLevel, NSPanel, NSRunningApplication, NSScreen, NSView, NSWindow,
     NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 #[cfg(target_os = "macos")]
@@ -173,6 +173,46 @@ fn mouse_launcher_position<R: Runtime>(
 }
 
 #[cfg(target_os = "macos")]
+fn rect_contains_point(rect: NSRect, point: NSPoint) -> bool {
+    point.x >= rect.origin.x
+        && point.x <= rect.origin.x + rect.size.width
+        && point.y >= rect.origin.y
+        && point.y <= rect.origin.y + rect.size.height
+}
+
+#[cfg(target_os = "macos")]
+fn visible_frame_for_mouse(mtm: MainThreadMarker, point: NSPoint) -> Option<NSRect> {
+    let screens = NSScreen::screens(mtm);
+    for screen in screens.iter() {
+        if rect_contains_point(screen.frame(), point) {
+            return Some(screen.visibleFrame());
+        }
+    }
+    NSScreen::mainScreen(mtm).map(|screen| screen.visibleFrame())
+}
+
+#[cfg(target_os = "macos")]
+fn native_mouse_launcher_top_left(mtm: MainThreadMarker) -> NSPoint {
+    let mouse = NSEvent::mouseLocation();
+    let visible = visible_frame_for_mouse(mtm, mouse).unwrap_or_else(|| {
+        NSRect::new(
+            NSPoint::new(16.0, 16.0),
+            NSSize::new(PANEL_WIDTH + 32.0, PANEL_HEIGHT + 32.0),
+        )
+    });
+    let margin = 16.0;
+    let min_x = visible.origin.x + margin;
+    let max_x = visible.origin.x + visible.size.width - PANEL_WIDTH - margin;
+    let min_top_y = visible.origin.y + PANEL_HEIGHT + margin;
+    let max_top_y = visible.origin.y + visible.size.height - margin;
+
+    NSPoint::new(
+        clamp(mouse.x - 80.0, min_x, max_x),
+        clamp(mouse.y + SEARCH_CENTER_Y, min_top_y, max_top_y),
+    )
+}
+
+#[cfg(target_os = "macos")]
 fn configure_launcher_panel<R: Runtime>(window: &WebviewWindow<R>) -> Result<(), String> {
     let ns_window = window.ns_window().map_err(|error| error.to_string())? as *mut NSWindow;
     if ns_window.is_null() {
@@ -301,16 +341,13 @@ fn start_native_launcher_panel_drag() -> Result<(), String> {
 }
 
 #[cfg(target_os = "macos")]
-fn show_native_launcher_panel<R: Runtime>(
-    window: &WebviewWindow<R>,
-    position: Option<PhysicalPosition<i32>>,
-) -> Result<(), String> {
+fn show_native_launcher_panel<R: Runtime>(window: &WebviewWindow<R>) -> Result<(), String> {
     let mtm = MainThreadMarker::new().ok_or_else(|| "Not on main thread".to_string())?;
-    let scale = window.scale_factor().unwrap_or(1.0);
-    let point = position
-        .map(|position| NSPoint::new(position.x as f64 / scale, position.y as f64 / scale))
-        .unwrap_or_else(|| NSPoint::new(0.0, 0.0));
-    let frame = NSRect::new(point, NSSize::new(PANEL_WIDTH, PANEL_HEIGHT));
+    let top_left = native_mouse_launcher_top_left(mtm);
+    let frame = NSRect::new(
+        NSPoint::new(top_left.x, top_left.y - PANEL_HEIGHT),
+        NSSize::new(PANEL_WIDTH, PANEL_HEIGHT),
+    );
 
     let content_view = unsafe {
         let tauri_ns_window =
@@ -384,7 +421,7 @@ fn show_native_launcher_panel<R: Runtime>(
         panel.setContentView(Some(webview));
     }
     panel.setFrame_display(frame, true);
-    panel.setFrameTopLeftPoint(point);
+    panel.setFrameTopLeftPoint(top_left);
     install_outside_click_monitor();
     panel.orderFrontRegardless();
     panel.makeKeyWindow();
@@ -416,11 +453,11 @@ fn show_launcher<R: Runtime>(app: &tauri::AppHandle<R>, surface: &'static str) {
         app: active_app,
     };
     if let Some(window) = app.get_webview_window("main") {
-        let position =
-            mouse_launcher_position(app, PANEL_WIDTH, PANEL_HEIGHT).map(|(position, _)| position);
         #[cfg(target_os = "macos")]
         {
-            if show_native_launcher_panel(&window, position).is_err() {
+            if show_native_launcher_panel(&window).is_err() {
+                let position = mouse_launcher_position(app, PANEL_WIDTH, PANEL_HEIGHT)
+                    .map(|(position, _)| position);
                 let _ = configure_launcher_panel(&window);
                 let _ = window.set_size(LogicalSize::new(PANEL_WIDTH, PANEL_HEIGHT));
                 if let Some(position) = position {
@@ -434,6 +471,8 @@ fn show_launcher<R: Runtime>(app: &tauri::AppHandle<R>, surface: &'static str) {
         }
         #[cfg(not(target_os = "macos"))]
         {
+            let position = mouse_launcher_position(app, PANEL_WIDTH, PANEL_HEIGHT)
+                .map(|(position, _)| position);
             let _ = configure_launcher_panel(&window);
             let _ = window.set_size(LogicalSize::new(PANEL_WIDTH, PANEL_HEIGHT));
             if let Some(position) = position {
