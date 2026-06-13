@@ -1,3 +1,5 @@
+#[cfg(target_os = "macos")]
+use std::ffi::c_void;
 use std::path::PathBuf;
 #[cfg(target_os = "macos")]
 use std::ptr::NonNull;
@@ -9,6 +11,11 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
 #[cfg(target_os = "macos")]
 use block2::RcBlock;
+#[cfg(target_os = "macos")]
+use core_foundation::{
+    base::{CFRelease, CFTypeRef, TCFType},
+    string::{CFString, CFStringRef},
+};
 #[cfg(target_os = "macos")]
 use objc2::{define_class, msg_send, rc::Retained, runtime::AnyObject, MainThreadOnly};
 #[cfg(target_os = "macos")]
@@ -69,6 +76,8 @@ static LAUNCHER_HOST_VIEW: AtomicPtr<NSView> = AtomicPtr::new(std::ptr::null_mut
 #[cfg(target_os = "macos")]
 static TARGET_APP_PID: AtomicI32 = AtomicI32::new(0);
 #[cfg(target_os = "macos")]
+static TARGET_WINDOW: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+#[cfg(target_os = "macos")]
 static OUTSIDE_CLICK_MONITOR: AtomicPtr<AnyObject> = AtomicPtr::new(std::ptr::null_mut());
 
 #[cfg(target_os = "macos")]
@@ -76,6 +85,13 @@ static OUTSIDE_CLICK_MONITOR: AtomicPtr<AnyObject> = AtomicPtr::new(std::ptr::nu
 extern "C" {
     fn AXIsProcessTrusted() -> bool;
     fn AXIsProcessTrustedWithOptions(options: *const std::ffi::c_void) -> bool;
+    fn AXUIElementCreateApplication(pid: i32) -> CFTypeRef;
+    fn AXUIElementCopyAttributeValue(
+        element: CFTypeRef,
+        attribute: CFStringRef,
+        value: *mut CFTypeRef,
+    ) -> i32;
+    fn AXUIElementPerformAction(element: CFTypeRef, action: CFStringRef) -> i32;
     static kAXTrustedCheckOptionPrompt: *const std::ffi::c_void;
 }
 
@@ -532,10 +548,77 @@ fn ns_string_to_string(value: &objc2_foundation::NSString) -> String {
 fn remember_target_application(app: Option<&ActiveApplication>) {
     let pid = app.and_then(|app| app.pid).unwrap_or_default();
     TARGET_APP_PID.store(pid.max(0), Ordering::SeqCst);
+    replace_target_window(
+        (pid > 0)
+            .then(|| focused_window_for_application(pid))
+            .flatten(),
+    );
 }
 
 #[cfg(not(target_os = "macos"))]
 fn remember_target_application(_app: Option<&ActiveApplication>) {}
+
+#[cfg(target_os = "macos")]
+fn replace_target_window(window: Option<CFTypeRef>) {
+    let new_window = window.unwrap_or(std::ptr::null());
+    let old_window = TARGET_WINDOW.swap(new_window.cast_mut().cast(), Ordering::SeqCst);
+    if !old_window.is_null() {
+        unsafe {
+            CFRelease(old_window.cast());
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn focused_window_for_application(pid: i32) -> Option<CFTypeRef> {
+    if unsafe { !AXIsProcessTrusted() } {
+        return None;
+    }
+
+    let app = unsafe { AXUIElementCreateApplication(pid) };
+    if app.is_null() {
+        return None;
+    }
+
+    let attribute = CFString::new("AXFocusedWindow");
+    let mut window: CFTypeRef = std::ptr::null();
+    let result =
+        unsafe { AXUIElementCopyAttributeValue(app, attribute.as_concrete_TypeRef(), &mut window) };
+    unsafe {
+        CFRelease(app);
+    }
+
+    if result == 0 && !window.is_null() {
+        Some(window)
+    } else {
+        if !window.is_null() {
+            unsafe {
+                CFRelease(window);
+            }
+        }
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn raise_target_window() -> bool {
+    if unsafe { !AXIsProcessTrusted() } {
+        return false;
+    }
+
+    let window = TARGET_WINDOW.load(Ordering::SeqCst);
+    if window.is_null() {
+        return false;
+    }
+
+    let action = CFString::new("AXRaise");
+    unsafe { AXUIElementPerformAction(window.cast(), action.as_concrete_TypeRef()) == 0 }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn raise_target_window() -> bool {
+    false
+}
 
 #[cfg(target_os = "macos")]
 fn activate_target_application() -> bool {
@@ -558,8 +641,7 @@ fn activate_target_application() -> bool {
     };
     let app = NSApplication::sharedApplication(mtm);
     app.yieldActivationToApplication(&target_app);
-    let requested =
-        target_app.activateWithOptions(NSApplicationActivationOptions::ActivateAllWindows);
+    let requested = target_app.activateWithOptions(NSApplicationActivationOptions::empty());
     for _ in 0..6 {
         if target_app.isActive() {
             break;
@@ -826,8 +908,13 @@ fn paste_to_frontmost_app() -> Result<(), String> {
 #[tauri::command]
 fn paste_after_hiding_launcher_panel() -> Result<(), String> {
     let _ = hide_native_launcher_panel();
+    let raised_target = raise_target_window();
     let restored_target = activate_target_application();
-    std::thread::sleep(Duration::from_millis(if restored_target { 15 } else { 10 }));
+    std::thread::sleep(Duration::from_millis(if raised_target || restored_target {
+        15
+    } else {
+        10
+    }));
     post_command_v()
 }
 
