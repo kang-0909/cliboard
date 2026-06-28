@@ -64,6 +64,13 @@ import type {
   ClipboardImagePayload,
   ClipboardSourceApp,
 } from './clipboardHistory'
+import {
+  DEFAULT_HISTORY_LIMIT,
+  MAX_HISTORY_LIMIT,
+  MIN_HISTORY_LIMIT,
+  commitHistoryLimitDraft,
+  normalizeHistoryLimit,
+} from './historyLimit'
 import { redactLogValue } from './logRedaction'
 import { hasSearchFilters, matchesSnippetFilters, parseSearchQuery } from './searchFilters'
 import {
@@ -351,10 +358,6 @@ const providerPresets = {
     thinkingMode: 'disabled' as ThinkingMode,
   },
 }
-
-const DEFAULT_HISTORY_LIMIT = MAX_HISTORY_ITEMS
-const MIN_HISTORY_LIMIT = 10
-const MAX_HISTORY_LIMIT = 1000
 
 const defaultSettings: SettingsState = {
   ...providerPresets.deepseek,
@@ -695,16 +698,6 @@ function parseMaybeJson(value: string) {
   } catch {
     return value
   }
-}
-
-function clampNumber(value: number, min: number, max: number) {
-  return Math.min(max, Math.max(min, value))
-}
-
-function normalizeHistoryLimit(value: unknown) {
-  const numeric = typeof value === 'number' ? value : Number(value)
-  if (!Number.isFinite(numeric)) return DEFAULT_HISTORY_LIMIT
-  return Math.round(clampNumber(numeric, MIN_HISTORY_LIMIT, MAX_HISTORY_LIMIT))
 }
 
 function jsonByteSize(value: unknown) {
@@ -4657,6 +4650,17 @@ function SettingsPanel({
 }: SettingsPanelProps) {
   const activeProvider = providerOption(settings)
   const isDevBuild = import.meta.env.DEV
+  const [historyLimitDraft, setHistoryLimitDraft] = useState<string | null>(null)
+  const skipNextHistoryLimitBlurRef = useRef(false)
+  const historyLimitInputValue = historyLimitDraft ?? String(settings.historyLimit)
+
+  function commitHistoryLimit() {
+    const nextLimit = commitHistoryLimitDraft(historyLimitInputValue, settings.historyLimit)
+    setHistoryLimitDraft(null)
+    if (nextLimit !== settings.historyLimit) {
+      onHistoryLimitChange(nextLimit)
+    }
+  }
 
   return (
     <div className="panel settings-panel">
@@ -4834,11 +4838,28 @@ function SettingsPanel({
               min={MIN_HISTORY_LIMIT}
               max={MAX_HISTORY_LIMIT}
               step={10}
-              value={settings.historyLimit}
-              onChange={(event) => {
-                if (event.target.value) onHistoryLimitChange(Number(event.target.value))
+              value={historyLimitInputValue}
+              onChange={(event) => setHistoryLimitDraft(event.target.value)}
+              onBlur={() => {
+                if (skipNextHistoryLimitBlurRef.current) {
+                  skipNextHistoryLimitBlurRef.current = false
+                  return
+                }
+                commitHistoryLimit()
               }}
-              onBlur={(event) => onHistoryLimitChange(Number(event.target.value))}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') {
+                  event.preventDefault()
+                  skipNextHistoryLimitBlurRef.current = true
+                  commitHistoryLimit()
+                  event.currentTarget.blur()
+                } else if (event.key === 'Escape') {
+                  event.preventDefault()
+                  skipNextHistoryLimitBlurRef.current = true
+                  setHistoryLimitDraft(null)
+                  event.currentTarget.blur()
+                }
+              }}
             />
             <span>items</span>
           </label>
