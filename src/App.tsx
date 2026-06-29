@@ -46,7 +46,6 @@ import {
   CLIPBOARD_HISTORY_KEY,
   MAX_HISTORY_ITEMS,
   base64ToBytes,
-  bytesToBase64,
   classifyRichTextClipboard,
   classifyTextClipboard,
   detectImageContentType,
@@ -336,7 +335,7 @@ const MAX_ASK_MESSAGES = 80
 const ASK_CONTEXT_MESSAGES = 16
 const MAX_LOG_ARRAY_ITEMS = 80
 const MAX_LOG_STRING_LENGTH = 1200
-const MAX_PERSISTED_ORIGINAL_IMAGE_BYTES = 64 * 1024 * 1024
+const MAX_PERSISTED_ORIGINAL_IMAGE_BYTES = 8 * 1024 * 1024
 const PASTE_AFTER_HIDE_DELAY_MS = 90
 const LLM_REQUEST_TIMEOUT_MS = 90_000
 const IS_MACOS = /mac/i.test(navigator.platform)
@@ -714,20 +713,32 @@ function base64ByteSize(value?: string) {
   return Math.max(0, Math.floor((value.length * 3) / 4) - padding)
 }
 
+function originalImageByteLength(image?: ClipboardImagePayload) {
+  return image?.originalByteLength ?? image?.rgbaBytes?.byteLength ?? base64ByteSize(image?.rgbaBase64)
+}
+
+function originalImageBytes(image: ClipboardImagePayload) {
+  if (image.rgbaBytes) return image.rgbaBytes
+  if (image.rgbaBase64) return base64ToBytes(image.rgbaBase64)
+  return undefined
+}
+
 function estimateClipboardStorageUsage(
   items: ClipboardHistoryItem[],
   limit: number,
 ): ClipboardStorageUsage {
   const compacted = compactHistoryForStorage(items, limit)
   const imageBytes = items.reduce(
-    (total, item) => total + base64ByteSize(item.image?.rgbaBase64),
+    (total, item) => total + originalImageByteLength(item.image),
     0,
   )
   return {
     imageBytes,
     itemCount: compacted.length,
     metadataBytes: jsonByteSize(compacted),
-    originalImageCount: items.filter((item) => item.image?.rgbaBase64).length,
+    originalImageCount: items.filter(
+      (item) => item.image?.rgbaBase64 || item.image?.rgbaBytes || item.image?.originalByteLength,
+    ).length,
     totalBytes: jsonByteSize(compacted) + imageBytes,
   }
 }
@@ -1025,8 +1036,12 @@ function loadSettings() {
   }
 }
 
-function loadClipboardHistory(limit = DEFAULT_HISTORY_LIMIT) {
-  return sanitizeClipboardHistory(loadJson<ClipboardHistoryItem[]>(CLIPBOARD_HISTORY_KEY, []), limit)
+function loadClipboardHistory(limit = DEFAULT_HISTORY_LIMIT, stripOriginalImages = true) {
+  return sanitizeClipboardHistory(
+    loadJson<ClipboardHistoryItem[]>(CLIPBOARD_HISTORY_KEY, []),
+    limit,
+    stripOriginalImages,
+  )
 }
 
 function shouldKeepOriginalImageBytes(width: number, height: number, byteLength: number) {
@@ -1037,14 +1052,29 @@ function shouldKeepOriginalImageBytes(width: number, height: number, byteLength:
 }
 
 function imageHistoryPayload(rgba: Uint8Array, width: number, height: number) {
+  const shouldKeepOriginal = shouldKeepOriginalImageBytes(width, height, rgba.byteLength)
   return {
     width,
     height,
-    rgbaBase64: shouldKeepOriginalImageBytes(width, height, rgba.byteLength)
-      ? bytesToBase64(rgba)
-      : undefined,
+    originalByteLength: shouldKeepOriginal ? rgba.byteLength : undefined,
+    rgbaBytes: shouldKeepOriginal ? rgba : undefined,
     previewDataUrl: imagePreviewDataUrl(rgba, width, height),
   }
+}
+
+function stripOriginalImageForMemory(item: ClipboardHistoryItem): ClipboardHistoryItem {
+  if (item.kind !== 'image' || (!item.image?.rgbaBase64 && !item.image?.rgbaBytes)) return item
+  const image = { ...item.image }
+  delete image.rgbaBase64
+  delete image.rgbaBytes
+  return {
+    ...item,
+    image,
+  }
+}
+
+function stripOriginalImagesForMemory(items: ClipboardHistoryItem[]) {
+  return items.map(stripOriginalImageForMemory)
 }
 
 function compactHistoryForStorage(items: ClipboardHistoryItem[], limit = MAX_HISTORY_ITEMS) {
@@ -1055,6 +1085,7 @@ function compactHistoryForStorage(items: ClipboardHistoryItem[], limit = MAX_HIS
       image: {
         width: item.image.width,
         height: item.image.height,
+        originalByteLength: originalImageByteLength(item.image),
         previewDataUrl: item.image.previewDataUrl,
         caption: item.image.caption,
       },
@@ -1062,7 +1093,11 @@ function compactHistoryForStorage(items: ClipboardHistoryItem[], limit = MAX_HIS
   })
 }
 
-function sanitizeClipboardHistory(value: unknown, limit = DEFAULT_HISTORY_LIMIT) {
+function sanitizeClipboardHistory(
+  value: unknown,
+  limit = DEFAULT_HISTORY_LIMIT,
+  stripOriginalImages = true,
+) {
   if (!Array.isArray(value)) return []
   const validItems = value
     .filter((item): item is ClipboardHistoryItem => {
@@ -1070,7 +1105,8 @@ function sanitizeClipboardHistory(value: unknown, limit = DEFAULT_HISTORY_LIMIT)
       const candidate = item as Partial<ClipboardHistoryItem>
       return Boolean(candidate.id && candidate.kind && candidate.signature)
     })
-  return trimHistoryItems(validItems, limit)
+  const trimmed = trimHistoryItems(validItems, limit)
+  return stripOriginalImages ? stripOriginalImagesForMemory(trimmed) : trimmed
 }
 
 function storedTime(item: ClipboardHistoryItem) {
@@ -1096,7 +1132,13 @@ function mergeStoredHistoryItems(limit: number, ...sources: ClipboardHistoryItem
         latest.kind === 'image' && latest.image
           ? {
               ...latest.image,
+              originalByteLength:
+                latest.image.originalByteLength ??
+                older.image?.originalByteLength ??
+                originalImageByteLength(latest.image) ??
+                originalImageByteLength(older.image),
               rgbaBase64: latest.image.rgbaBase64 ?? older.image?.rgbaBase64,
+              rgbaBytes: latest.image.rgbaBytes ?? older.image?.rgbaBytes,
               previewDataUrl: latest.image.previewDataUrl ?? older.image?.previewDataUrl,
               caption: latest.image.caption ?? older.image?.caption,
             }
@@ -1137,54 +1179,25 @@ function openHistoryDatabase() {
   })
 }
 
-async function readOriginalImagesFromIndexedDb(items: ClipboardHistoryItem[]) {
-  const imageItems = items.filter((item) => item.kind === 'image' && item.image)
-  if (!imageItems.length) return items
-
+async function readOriginalImageFromIndexedDb(signature: string) {
   const database = await openHistoryDatabase()
   try {
-    const transaction = database.transaction(HISTORY_IMAGE_STORE_NAME, 'readonly')
-    const store = transaction.objectStore(HISTORY_IMAGE_STORE_NAME)
-    const hydrated = await Promise.all(
-      items.map(
-        (item) =>
-          new Promise<ClipboardHistoryItem>((resolve) => {
-            const image = item.image
-            if (item.kind !== 'image' || !image || image.rgbaBase64) {
-              resolve(item)
-              return
-            }
-            const request = store.get(item.signature)
-            request.onsuccess = () => {
-              const payload = request.result as ClipboardImagePayload | undefined
-              resolve(
-                payload?.rgbaBase64
-                  ? {
-                      ...item,
-                      image: {
-                        ...image,
-                        rgbaBase64: payload.rgbaBase64,
-                        width: payload.width ?? image.width,
-                        height: payload.height ?? image.height,
-                      },
-                    }
-                  : item,
-              )
-            }
-            request.onerror = () => resolve(item)
-          }),
-      ),
-    )
-    return hydrated
+    return await new Promise<ClipboardImagePayload | undefined>((resolve, reject) => {
+      const transaction = database.transaction(HISTORY_IMAGE_STORE_NAME, 'readonly')
+      const request = transaction.objectStore(HISTORY_IMAGE_STORE_NAME).get(signature)
+      request.onsuccess = () => resolve(request.result as ClipboardImagePayload | undefined)
+      request.onerror = () =>
+        reject(request.error ?? new Error('Failed to read clipboard image original'))
+    })
   } finally {
     database.close()
   }
 }
 
 async function writeOriginalImagesToIndexedDb(items: ClipboardHistoryItem[]) {
-  const imageItems = items.filter((item) => item.kind === 'image' && item.image?.rgbaBase64)
-  if (!imageItems.length) return
-
+  const imageItems = items.filter(
+    (item) => item.kind === 'image' && (item.image?.rgbaBase64 || item.image?.rgbaBytes),
+  )
   const activeSignatures = new Set(items.map((item) => item.signature))
   const database = await openHistoryDatabase()
   try {
@@ -1194,11 +1207,13 @@ async function writeOriginalImagesToIndexedDb(items: ClipboardHistoryItem[]) {
 
       for (const item of imageItems) {
         const image = item.image
-        if (!image?.rgbaBase64) continue
+        if (!image?.rgbaBase64 && !image?.rgbaBytes) continue
         store.put(
           {
             width: image.width,
             height: image.height,
+            originalByteLength: originalImageByteLength(image),
+            rgbaBytes: image.rgbaBytes,
             rgbaBase64: image.rgbaBase64,
           } satisfies ClipboardImagePayload,
           item.signature,
@@ -1218,6 +1233,33 @@ async function writeOriginalImagesToIndexedDb(items: ClipboardHistoryItem[]) {
         reject(transaction.error ?? new Error('Failed to write clipboard image history'))
       transaction.onabort = () =>
         reject(transaction.error ?? new Error('Aborted writing clipboard image history'))
+    })
+  } finally {
+    database.close()
+  }
+}
+
+async function writeOriginalImageToIndexedDb(item: ClipboardHistoryItem) {
+  const image = item.kind === 'image' ? item.image : undefined
+  if (!image?.rgbaBase64 && !image?.rgbaBytes) return
+
+  const database = await openHistoryDatabase()
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const transaction = database.transaction(HISTORY_IMAGE_STORE_NAME, 'readwrite')
+      const request = transaction.objectStore(HISTORY_IMAGE_STORE_NAME).put(
+          {
+            width: image.width,
+            height: image.height,
+            originalByteLength: originalImageByteLength(image),
+            rgbaBytes: image.rgbaBytes,
+            rgbaBase64: image.rgbaBase64,
+          } satisfies ClipboardImagePayload,
+        item.signature,
+      )
+      request.onsuccess = () => resolve()
+      request.onerror = () =>
+        reject(request.error ?? new Error('Failed to write clipboard image original'))
     })
   } finally {
     database.close()
@@ -1265,13 +1307,14 @@ async function loadClipboardHistoryFromStorage(limit: number) {
     // Fall through to the old localStorage key for browser previews and migration.
   }
 
-  const localItems = loadClipboardHistory(limit)
+  const localItems = loadClipboardHistory(limit, false)
   const merged = mergeStoredHistoryItems(limit, indexedItems, localItems)
   try {
-    return await readOriginalImagesFromIndexedDb(merged)
+    await writeOriginalImagesToIndexedDb(merged)
   } catch {
-    return merged
+    // Loading history should not fail just because image migration/pruning failed.
   }
+  return stripOriginalImagesForMemory(merged)
 }
 
 async function saveClipboardHistory(items: ClipboardHistoryItem[], limit: number) {
@@ -1553,6 +1596,14 @@ async function readActiveApplication() {
   }
 }
 
+async function readClipboardChangeCount() {
+  try {
+    return await invoke<number | null>('clipboard_change_count')
+  } catch {
+    return null
+  }
+}
+
 function appUsageKey(app?: ClipboardSourceApp | null) {
   return app?.bundleId?.trim() || app?.name?.trim() || ''
 }
@@ -1675,27 +1726,34 @@ function snippetAppUsageBoost(snippet: Snippet, targetApp?: ClipboardSourceApp |
 }
 
 function imagePreviewDataUrl(rgba: Uint8Array, width: number, height: number) {
-  const source = document.createElement('canvas')
-  source.width = width
-  source.height = height
-  const sourceContext = source.getContext('2d')
-  if (!sourceContext) return undefined
-
-  sourceContext.putImageData(new ImageData(new Uint8ClampedArray(rgba), width, height), 0, 0)
   const scale = Math.min(1, IMAGE_PREVIEW_MAX_EDGE / Math.max(width, height))
   const targetWidth = Math.max(1, Math.round(width * scale))
   const targetHeight = Math.max(1, Math.round(height * scale))
-
-  if (scale === 1) return source.toDataURL('image/png')
-
   const target = document.createElement('canvas')
   target.width = targetWidth
   target.height = targetHeight
-  target.getContext('2d')?.drawImage(source, 0, 0, targetWidth, targetHeight)
+  const targetContext = target.getContext('2d')
+  if (!targetContext) return undefined
+
+  const preview = targetContext.createImageData(targetWidth, targetHeight)
+  const targetPixels = preview.data
+  for (let y = 0; y < targetHeight; y += 1) {
+    const sourceY = Math.min(height - 1, Math.floor(y / scale))
+    for (let x = 0; x < targetWidth; x += 1) {
+      const sourceX = Math.min(width - 1, Math.floor(x / scale))
+      const sourceIndex = (sourceY * width + sourceX) * 4
+      const targetIndex = (y * targetWidth + x) * 4
+      targetPixels[targetIndex] = rgba[sourceIndex]
+      targetPixels[targetIndex + 1] = rgba[sourceIndex + 1]
+      targetPixels[targetIndex + 2] = rgba[sourceIndex + 2]
+      targetPixels[targetIndex + 3] = rgba[sourceIndex + 3]
+    }
+  }
+  targetContext.putImageData(preview, 0, 0)
   return target.toDataURL('image/png')
 }
 
-async function readClipboardHistoryItem() {
+async function readClipboardHistoryItem(knownSignature?: string, changeCount?: number | null) {
   const sourceApp = await readActiveApplication()
   const historySourceApp = sourceApp ?? undefined
   const files = await readClipboardFiles()
@@ -1719,12 +1777,41 @@ async function readClipboardHistoryItem() {
   try {
     const image = await readImage()
     const size = await image.size()
-    const rgba = await image.rgba()
-    if (size.width > 0 && size.height > 0 && rgba.byteLength > 0) {
-      const hash = hashBytes(rgba)
+    const expectedByteLength = size.width * size.height * 4
+    if (
+      size.width > 0 &&
+      size.height > 0 &&
+      !shouldKeepOriginalImageBytes(size.width, size.height, expectedByteLength)
+    ) {
+      const contentType = detectImageContentType(
+        { width: size.width, height: size.height },
+        historySourceApp,
+      )
+      const hash = `large-${changeCount ?? `${size.width}x${size.height}`}`
       return draftToHistoryItem({
         kind: 'image',
         hash,
+        contentType,
+        image: {
+          width: size.width,
+          height: size.height,
+        },
+        sourceApp: historySourceApp,
+      })
+    }
+    const rgba = await image.rgba()
+    if (size.width > 0 && size.height > 0 && rgba.byteLength > 0) {
+      const hash = hashBytes(rgba)
+      const contentType = detectImageContentType(
+        { width: size.width, height: size.height },
+        historySourceApp,
+      )
+      const signature = `${contentType}:${size.width}x${size.height}:${hash}`
+      if (signature === knownSignature) return null
+      return draftToHistoryItem({
+        kind: 'image',
+        hash,
+        contentType,
         image: imageHistoryPayload(rgba, size.width, size.height),
         sourceApp: historySourceApp,
       })
@@ -2934,6 +3021,7 @@ function App() {
   const snippetRowRefs = useRef(new Map<string, HTMLDivElement>())
   const historyRowRefs = useRef(new Map<string, HTMLDivElement>())
   const latestClipboardSignature = useRef('')
+  const latestClipboardChangeCount = useRef<number | null>(null)
   const clipboardSampleInFlight = useRef(false)
   const clipboardSamplePending = useRef(false)
   const initialHistoryLimitRef = useRef(settings.historyLimit)
@@ -3030,7 +3118,7 @@ function App() {
   )
   const selectedHistoryCopyable =
     selectedHistoryItem &&
-    (selectedHistoryItem.kind !== 'image' || Boolean(selectedHistoryItem.image?.rgbaBase64))
+    (selectedHistoryItem.kind !== 'image' || Boolean(selectedHistoryItem.image))
   const clipboardStorageUsage = useMemo(
     () => estimateClipboardStorageUsage(historyItems, settings.historyLimit),
     [historyItems, settings.historyLimit],
@@ -3258,39 +3346,63 @@ function App() {
       clipboardSampleInFlight.current = true
       const startedAt = performance.now()
       try {
-        const item = await readClipboardHistoryItem()
+        const changeCount = await readClipboardChangeCount()
+        if (changeCount !== null && changeCount === latestClipboardChangeCount.current) return
+
+        const item = await readClipboardHistoryItem(
+          latestClipboardSignature.current,
+          changeCount,
+        )
+        if (changeCount !== null) {
+          latestClipboardChangeCount.current = changeCount
+        }
         if (cancelled || !item || item.signature === latestClipboardSignature.current) return
 
         latestClipboardSignature.current = item.signature
+        if (item.kind === 'image' && (item.image?.rgbaBase64 || item.image?.rgbaBytes)) {
+          await writeOriginalImageToIndexedDb(item).catch((error) =>
+            console.warn('Cliboard failed to persist clipboard image original', error),
+          )
+        }
+        const memoryItem = stripOriginalImageForMemory(item)
         setHistoryItems((current) => {
-          const nextItems = mergeHistoryItem(current, item, settings.historyLimit)
+          const nextItems = mergeHistoryItem(current, memoryItem, settings.historyLimit)
           historyItemsRef.current = nextItems
           return nextItems
         })
         setSelectedHistoryId('')
-        if (item.kind === 'image' && item.image?.previewDataUrl && !item.image.caption) {
-          void generateImageCaption(item.image.previewDataUrl)
+        if (
+          memoryItem.kind === 'image' &&
+          memoryItem.image?.previewDataUrl &&
+          !memoryItem.image.caption
+        ) {
+          void generateImageCaption(memoryItem.image.previewDataUrl)
             .then((caption) => {
               if (!caption || cancelled) return
               setHistoryItems((current) => {
                 const nextItems = trimHistoryItems(
-                  current.map((historyItem) =>
-                    historyItem.signature === item.signature && historyItem.kind === 'image'
-                      ? {
-                          ...historyItem,
-                          contentType: detectImageContentType(
-                            { ...(historyItem.image ?? item.image), caption },
-                            historyItem.sourceApp,
-                          ),
-                          title: caption,
-                          subtitle: `${caption.toLowerCase().includes('screenshot') ? 'Screenshot' : 'Image'} · ${historyItem.image?.width ?? item.image?.width}×${historyItem.image?.height ?? item.image?.height} pixels`,
-                          image: historyItem.image
-                            ? { ...historyItem.image, caption }
-                            : historyItem.image,
-                          updatedAt: now(),
-                        }
-                      : historyItem,
-                  ),
+                  current.map((historyItem) => {
+                    if (
+                      historyItem.signature !== memoryItem.signature ||
+                      historyItem.kind !== 'image'
+                    ) {
+                      return historyItem
+                    }
+                    const fallbackImage = memoryItem.image
+                    if (!fallbackImage) return historyItem
+                    const image = historyItem.image ?? fallbackImage
+                    return {
+                      ...historyItem,
+                      contentType: detectImageContentType(
+                        { ...image, caption },
+                        historyItem.sourceApp,
+                      ),
+                      title: caption,
+                      subtitle: `${caption.toLowerCase().includes('screenshot') ? 'Screenshot' : 'Image'} · ${image.width}×${image.height} pixels`,
+                      image: historyItem.image ? { ...historyItem.image, caption } : historyItem.image,
+                      updatedAt: now(),
+                    }
+                  }),
                   settings.historyLimit,
                 )
                 historyItemsRef.current = nextItems
@@ -4022,13 +4134,17 @@ function App() {
           await copyToClipboard(itemToClipboardText(item))
         }
       } else if (item.kind === 'image' && item.image) {
-        if (!item.image.rgbaBase64) {
+        const originalImage = item.image.rgbaBase64 || item.image.rgbaBytes
+          ? item.image
+          : await readOriginalImageFromIndexedDb(item.signature)
+        const bytes = originalImage ? originalImageBytes(originalImage) : undefined
+        if (!originalImage || !bytes) {
           throw new Error('Original image data is unavailable in this older history item')
         }
         const image = await TauriImage.new(
-          base64ToBytes(item.image.rgbaBase64),
-          item.image.width,
-          item.image.height,
+          bytes,
+          originalImage.width ?? item.image.width,
+          originalImage.height ?? item.image.height,
         )
         await writeImage(image)
       } else if (item.html) {
@@ -4056,7 +4172,9 @@ function App() {
           copy_kind: item.kind,
           content_type: item.contentType,
           has_html: Boolean(item.html),
-          has_original_image: Boolean(item.image?.rgbaBase64),
+          has_original_image: Boolean(
+            item.image?.rgbaBase64 || item.image?.rgbaBytes || item.image?.originalByteLength,
+          ),
           source_app: item.sourceApp,
         },
       })
@@ -4472,7 +4590,7 @@ function HistoryPanel({
   const [isEditing, setIsEditing] = useState(false)
   const editorRef = useRef<HTMLDivElement | null>(null)
   const saveEditingRef = useRef<() => boolean>(() => false)
-  const canCopy = item.kind !== 'image' || Boolean(item.image?.rgbaBase64)
+  const canCopy = item.kind !== 'image' || Boolean(item.image)
   const canCreateSnippet = Boolean(itemToClipboardText(item).trim())
   const canEdit = item.kind === 'text' || item.kind === 'file'
 

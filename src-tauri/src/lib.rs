@@ -22,7 +22,7 @@ use objc2::{define_class, msg_send, rc::Retained, runtime::AnyObject, MainThread
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationOptions, NSApplicationActivationPolicy,
     NSAutoresizingMaskOptions, NSBackingStoreType, NSColor, NSEvent, NSEventMask,
-    NSFloatingWindowLevel, NSPanel, NSRunningApplication, NSScreen, NSView, NSWindow,
+    NSFloatingWindowLevel, NSPanel, NSPasteboard, NSRunningApplication, NSScreen, NSView, NSWindow,
     NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 #[cfg(target_os = "macos")]
@@ -709,6 +709,16 @@ fn active_application() -> Option<ActiveApplication> {
 }
 
 #[cfg(target_os = "macos")]
+fn system_clipboard_change_count() -> Option<i64> {
+    Some(NSPasteboard::generalPasteboard().changeCount() as i64)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn system_clipboard_change_count() -> Option<i64> {
+    None
+}
+
+#[cfg(target_os = "macos")]
 fn post_command_v() -> Result<(), String> {
     use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation};
     use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
@@ -901,6 +911,11 @@ fn read_active_application() -> Option<ActiveApplication> {
 }
 
 #[tauri::command]
+fn clipboard_change_count() -> Option<i64> {
+    system_clipboard_change_count()
+}
+
+#[tauri::command]
 fn paste_to_frontmost_app() -> Result<(), String> {
     post_command_v()
 }
@@ -943,6 +958,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             chat_completion,
             chat_completion_stream,
+            clipboard_change_count,
             hide_launcher_panel,
             paste_after_hiding_launcher_panel,
             paste_to_frontmost_app,

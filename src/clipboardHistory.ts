@@ -19,6 +19,8 @@ export type ClipboardImagePayload = {
   width: number
   height: number
   rgbaBase64?: string
+  rgbaBytes?: Uint8Array
+  originalByteLength?: number
   previewDataUrl?: string
   caption?: string
 }
