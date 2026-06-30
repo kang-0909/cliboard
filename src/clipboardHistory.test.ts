@@ -2,12 +2,14 @@ import { describe, expect, it } from 'vitest'
 import {
   base64ToBytes,
   bytesToBase64,
+  canCopyHistoryItem,
   classifyRichTextClipboard,
   classifyTextClipboard,
   detectFilePaths,
   detectTextContentType,
   draftToHistoryItem,
   hashBytes,
+  hasImageOriginalPayload,
   historyItemToSearchable,
   itemToClipboardText,
   mergeHistoryItem,
@@ -263,6 +265,31 @@ describe('clipboard history item lifecycle', () => {
     expect(result.items).toHaveLength(1)
     expect(result.items[0].id).toBe(alpha.id)
     expect(result.selectedId).toBe(alpha.id)
+  })
+
+  it('only treats image history as copyable when original image data is available', () => {
+    const previewOnly = draftToHistoryItem({
+      kind: 'image',
+      hash: 'large-1',
+      image: {
+        width: 4096,
+        height: 4096,
+      },
+    })
+    const storedOriginal = draftToHistoryItem({
+      kind: 'image',
+      hash: 'small-1',
+      image: {
+        width: 64,
+        height: 64,
+        originalByteLength: 64 * 64 * 4,
+        previewDataUrl: 'data:image/png;base64,preview',
+      },
+    })
+
+    expect(hasImageOriginalPayload(previewOnly.image)).toBe(false)
+    expect(canCopyHistoryItem(previewOnly)).toBe(false)
+    expect(canCopyHistoryItem(storedOriginal)).toBe(true)
   })
 })
 

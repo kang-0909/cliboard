@@ -46,11 +46,13 @@ import {
   CLIPBOARD_HISTORY_KEY,
   MAX_HISTORY_ITEMS,
   base64ToBytes,
+  canCopyHistoryItem,
   classifyRichTextClipboard,
   classifyTextClipboard,
   detectImageContentType,
   draftToHistoryItem,
   hashBytes,
+  hasImageOriginalPayload,
   itemToClipboardText,
   mergeHistoryItem,
   rankHistoryItems,
@@ -781,6 +783,11 @@ function MarkdownMessage({ content }: { content: string }) {
             >
               {children}
             </a>
+          ),
+          img: ({ alt }) => (
+            <span className="markdown-image-placeholder">
+              {alt ? `[image: ${alt}]` : '[image hidden]'}
+            </span>
           ),
       }}
       rehypePlugins={[rehypeKatex]}
@@ -3118,7 +3125,7 @@ function App() {
   )
   const selectedHistoryCopyable =
     selectedHistoryItem &&
-    (selectedHistoryItem.kind !== 'image' || Boolean(selectedHistoryItem.image))
+    canCopyHistoryItem(selectedHistoryItem)
   const clipboardStorageUsage = useMemo(
     () => estimateClipboardStorageUsage(historyItems, settings.historyLimit),
     [historyItems, settings.historyLimit],
@@ -4134,6 +4141,9 @@ function App() {
           await copyToClipboard(itemToClipboardText(item))
         }
       } else if (item.kind === 'image' && item.image) {
+        if (!canCopyHistoryItem(item)) {
+          throw new Error('Original image data was not saved for this large history item')
+        }
         const originalImage = item.image.rgbaBase64 || item.image.rgbaBytes
           ? item.image
           : await readOriginalImageFromIndexedDb(item.signature)
@@ -4172,9 +4182,7 @@ function App() {
           copy_kind: item.kind,
           content_type: item.contentType,
           has_html: Boolean(item.html),
-          has_original_image: Boolean(
-            item.image?.rgbaBase64 || item.image?.rgbaBytes || item.image?.originalByteLength,
-          ),
+          has_original_image: hasImageOriginalPayload(item.image),
           source_app: item.sourceApp,
         },
       })
@@ -4590,7 +4598,7 @@ function HistoryPanel({
   const [isEditing, setIsEditing] = useState(false)
   const editorRef = useRef<HTMLDivElement | null>(null)
   const saveEditingRef = useRef<() => boolean>(() => false)
-  const canCopy = item.kind !== 'image' || Boolean(item.image)
+  const canCopy = canCopyHistoryItem(item)
   const canCreateSnippet = Boolean(itemToClipboardText(item).trim())
   const canEdit = item.kind === 'text' || item.kind === 'file'
 
@@ -4721,6 +4729,7 @@ function HistoryPanel({
             )}
             <span>
               {item.image.width} × {item.image.height}
+              {!canCopy ? ' · original not saved' : ''}
             </span>
           </div>
         ) : item.kind === 'file' ? (

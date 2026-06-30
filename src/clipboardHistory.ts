@@ -315,6 +315,14 @@ export function trimHistoryItems(items: ClipboardHistoryItem[], limit = MAX_HIST
   return [...kept, ...protectedPinned]
 }
 
+export function hasImageOriginalPayload(image?: ClipboardImagePayload) {
+  return Boolean(image?.rgbaBase64 || image?.rgbaBytes || image?.originalByteLength)
+}
+
+export function canCopyHistoryItem(item: ClipboardHistoryItem) {
+  return item.kind !== 'image' || hasImageOriginalPayload(item.image)
+}
+
 export function historySearchText(item: ClipboardHistoryItem) {
   return [
     item.kind,

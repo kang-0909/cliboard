@@ -13,6 +13,9 @@ export type SearchableSnippet = {
 export type SnippetIndexMethod = 'keyword' | 'hybrid'
 
 const SIMILARITY_VECTOR_DIMENSIONS = 128
+const EXPANDED_TOKEN_CACHE_LIMIT = 1000
+const SNIPPET_VECTOR_CACHE_LIMIT = 3000
+const QUERY_VECTOR_CACHE_LIMIT = 1000
 
 const synonymGroups = [
   ['下载', 'download', 'pull', 'fetch'],
@@ -55,6 +58,27 @@ for (const group of synonymGroups) {
 
 const expandedTokenCache = new Map<string, string[]>()
 
+function readCacheEntry<K, V>(cache: Map<K, V>, key: K) {
+  if (!cache.has(key)) return undefined
+  const value = cache.get(key) as V
+  cache.delete(key)
+  cache.set(key, value)
+  return value
+}
+
+function rememberCacheEntry<K, V>(cache: Map<K, V>, key: K, value: V, limit: number) {
+  if (cache.has(key)) cache.delete(key)
+  cache.set(key, value)
+
+  while (cache.size > limit) {
+    const oldestKey = cache.keys().next().value as K | undefined
+    if (oldestKey === undefined) break
+    cache.delete(oldestKey)
+  }
+
+  return value
+}
+
 export function normalizeText(value: string) {
   return value.trim().toLowerCase()
 }
@@ -79,7 +103,7 @@ export function tokenize(value: string) {
 
 function expandedTokens(value: string) {
   const normalized = normalizeText(value)
-  const cached = expandedTokenCache.get(normalized)
+  const cached = readCacheEntry(expandedTokenCache, normalized)
   if (cached) return cached
 
   const tokens = tokenize(value)
@@ -95,8 +119,7 @@ function expandedTokens(value: string) {
     }
   }
   const result = Array.from(expanded)
-  expandedTokenCache.set(normalized, result)
-  return result
+  return rememberCacheEntry(expandedTokenCache, normalized, result, EXPANDED_TOKEN_CACHE_LIMIT)
 }
 
 function hashDimension(value: string) {
@@ -287,16 +310,26 @@ export function localSimilarityScore(snippet: SearchableSnippet, query: string) 
   if (!normalizedQuery) return keywordScore(snippet, query)
 
   const source = snippetSearchText(snippet)
-  const cached = snippetVectorCache.get(snippet.id)
+  const cached = readCacheEntry(snippetVectorCache, snippet.id)
   const snippetVector = cached?.source === source
     ? cached.vector
     : buildLocalSimilarityVector(source)
   if (cached?.source !== source) {
-    snippetVectorCache.set(snippet.id, { source, vector: snippetVector })
+    rememberCacheEntry(
+      snippetVectorCache,
+      snippet.id,
+      { source, vector: snippetVector },
+      SNIPPET_VECTOR_CACHE_LIMIT,
+    )
   }
 
-  const queryVector = queryVectorCache.get(normalizedQuery) ?? buildLocalSimilarityVector(normalizedQuery)
-  queryVectorCache.set(normalizedQuery, queryVector)
+  const queryVector = readCacheEntry(queryVectorCache, normalizedQuery) ??
+    rememberCacheEntry(
+      queryVectorCache,
+      normalizedQuery,
+      buildLocalSimilarityVector(normalizedQuery),
+      QUERY_VECTOR_CACHE_LIMIT,
+    )
 
   const similarity = cosineSimilarity(snippetVector, queryVector)
   return similarity >= 0.08 ? Math.round(similarity * 100) + contextTreeBoost(snippet, query) : 0
